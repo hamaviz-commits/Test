@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>تولید گفتار Gemini</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --ink:#1d2330; --muted:#6b7385; --line:#dfe3ea; --accent:#2457d6; --err:#b42318; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#14161b; --card:#1d2027; --ink:#e8eaf0; --muted:#9aa1b2; --line:#30343d; --accent:#7aa2ff; --err:#ff8a80; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:16px/1.6 system-ui, -apple-system, "Segoe UI", Tahoma, sans-serif; }
+  main { max-width:640px; margin:0 auto; padding:16px; }
+  h1 { font-size:20px; margin:4px 0 16px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:14px; margin-bottom:14px; }
+  label { display:block; font-size:14px; color:var(--muted); margin:10px 0 4px; }
+  input, textarea { width:100%; font:inherit; color:var(--ink); background:transparent; border:1px solid var(--line); border-radius:10px; padding:10px; }
+  textarea { min-height:180px; resize:vertical; }
+  .ltr { direction:ltr; text-align:left; }
+  .row { display:flex; gap:10px; }
+  .row > div { flex:1; }
+  button { font:inherit; border:0; border-radius:12px; padding:12px 16px; cursor:pointer; }
+  .primary { width:100%; background:var(--accent); color:#fff; font-weight:600; font-size:17px; }
+  .primary:disabled { opacity:.6; cursor:wait; }
+  .ghost { background:transparent; color:var(--accent); padding:6px 0; }
+  details summary { cursor:pointer; color:var(--muted); font-size:14px; }
+  #status { min-height:1.6em; margin:10px 0 0; font-size:14px; color:var(--muted); }
+  #status.err { color:var(--err); }
+  audio { width:100%; margin-top:12px; }
+  #dl { display:none; margin-top:8px; color:var(--accent); }
+  .hint { font-size:13px; color:var(--muted); }
+</style>
+</head>
+<body>
+<main>
+  <h1>تولید گفتار با Gemini</h1>
+
+  <div class="card">
+    <label for="text">متن</label>
+    <textarea id="text" dir="auto" placeholder="متن را اینجا بنویسید…"></textarea>
+    <div style="margin-top:12px">
+      <button id="go" class="primary">ساخت صدا</button>
+    </div>
+    <div id="status"></div>
+    <audio id="player" controls hidden></audio>
+    <a id="dl" download="speech.wav">ذخیره فایل صوتی</a>
+  </div>
+
+  <div class="card">
+    <details id="settingsBox">
+      <summary>تنظیمات (یک بار وارد کنید، روی همین گوشی ذخیره می‌شود)</summary>
+      <label for="key">کلید API</label>
+      <input id="key" class="ltr" type="password" autocomplete="off" placeholder="AIza…">
+      <p class="hint">کلید را از aistudio.google.com/apikey بگیرید. فقط در مرورگر همین گوشی ذخیره می‌شود و به جای دیگری جز گوگل فرستاده نمی‌شود.</p>
+      <label for="model">مدل</label>
+      <input id="model" class="ltr" value="gemini-3.8-flash-tts">
+      <div class="row">
+        <div>
+          <label for="voice">گوینده</label>
+          <input id="voice" class="ltr" value="Fola">
+        </div>
+        <div>
+          <label for="temp">دما</label>
+          <input id="temp" class="ltr" type="number" min="0" max="2" step="0.1" value="0">
+        </div>
+      </div>
+      <label for="instr">دستور ابتدای متن (خود متن شما تغییر نمی‌کند)</label>
+      <textarea id="instr" class="ltr" style="min-height:70px">Read the following text exactly as written, word for word, without adding, skipping or changing anything:</textarea>
+      <p class="hint">این جمله فقط هنگام ارسال، قبل از متن شما گذاشته می‌شود. اگر نمی‌خواهید، خالی‌اش کنید.</p>
+      <button id="save" class="ghost">ذخیره تنظیمات</button>
+    </details>
+  </div>
+</main>
+
+<script>
+(function () {
+  const $ = (id) => document.getElementById(id);
+  const fields = ["key", "model", "voice", "temp", "instr"];
+  const PREFIX = "gemini-tts-";
+
+  function load() {
+    try {
+      fields.forEach((f) => {
+        const v = localStorage.getItem(PREFIX + f);
+        if (v !== null) $(f).value = v;
+      });
+      const draft = localStorage.getItem(PREFIX + "draft");
+      if (draft) $("text").value = draft;
+    } catch (e) {}
+    if (!$("key").value) $("settingsBox").open = true;
+  }
+  function save(quiet) {
+    try {
+      fields.forEach((f) => localStorage.setItem(PREFIX + f, $(f).value.trim()));
+      if (!quiet) status("تنظیمات ذخیره شد.");
+    } catch (e) {
+      if (!quiet) status("این مرورگر اجازه ذخیره نمی‌دهد.", true);
+    }
+  }
+  function status(msg, isErr) {
+    const s = $("status");
+    s.textContent = msg || "";
+    s.className = isErr ? "err" : "";
+  }
+
+  function pcmToWav(bytes, sampleRate) {
+    const header = new ArrayBuffer(44);
+    const v = new DataView(header);
+    const w = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+    w(0, "RIFF"); v.setUint32(4, 36 + bytes.length, true); w(8, "WAVE");
+    w(12, "fmt "); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+    v.setUint32(24, sampleRate, true); v.setUint32(28, sampleRate * 2, true);
+    v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+    w(36, "data"); v.setUint32(40, bytes.length, true);
+    return new Blob([header, bytes], { type: "audio/wav" });
+  }
+  function b64ToBytes(b64) {
+    const bin = atob(b64);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+
+  let lastUrl = null;
+
+  async function generate() {
+    const key = $("key").value.trim();
+    const model = $("model").value.trim();
+    const voice = $("voice").value.trim();
+    const temp = parseFloat($("temp").value);
+    const text = $("text").value.trim();
+    if (!key) { $("settingsBox").open = true; status("اول کلید API را وارد کنید.", true); return; }
+    if (!text) { status("متنی وارد نشده.", true); return; }
+    save(true);
+
+    const instr = $("instr").value.trim();
+    const fullText = instr ? instr + "\n\n" + text : text;
+    const body = {
+      contents: [{ parts: [{ text: fullText }] }],
+      generationConfig: {
+        responseModalities: ["AUDIO"],
+        temperature: isNaN(temp) ? 0 : temp,
+        speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: voice } } }
+      }
+    };
+
+    $("go").disabled = true;
+    status("در حال ساخت صدا…");
+    try {
+      const res = await fetch(
+        "https://generativelanguage.googleapis.com/v1beta/models/" + encodeURIComponent(model) + ":generateContent",
+        { method: "POST", headers: { "Content-Type": "application/json", "x-goog-api-key": key }, body: JSON.stringify(body) }
+      );
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const msg = (data.error && data.error.message) || ("HTTP " + res.status);
+        throw new Error(msg);
+      }
+      const parts = (data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts) || [];
+      const audioPart = parts.find((p) => p.inlineData && p.inlineData.data);
+      if (!audioPart) throw new Error("پاسخ گوگل صدا نداشت.");
+      const mime = audioPart.inlineData.mimeType || "";
+      const rateMatch = mime.match(/rate=(\d+)/);
+      const bytes = b64ToBytes(audioPart.inlineData.data);
+      const blob = /wav/i.test(mime) ? new Blob([bytes], { type: "audio/wav" }) : pcmToWav(bytes, rateMatch ? parseInt(rateMatch[1], 10) : 24000);
+
+      if (lastUrl) URL.revokeObjectURL(lastUrl);
+      lastUrl = URL.createObjectURL(blob);
+      const player = $("player");
+      player.src = lastUrl;
+      player.hidden = false;
+      $("dl").href = lastUrl;
+      $("dl").style.display = "inline-block";
+      status("آماده است.");
+      player.play().catch(() => {});
+    } catch (e) {
+      status("خطا: " + e.message, true);
+    } finally {
+      $("go").disabled = false;
+    }
+  }
+
+  $("go").addEventListener("click", generate);
+  $("save").addEventListener("click", () => save(false));
+  $("text").addEventListener("input", () => { try { localStorage.setItem(PREFIX + "draft", $("text").value); } catch (e) {} });
+  load();
+})();
+</script>
+</body>
+</html>
