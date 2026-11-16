@@ -74,9 +74,9 @@
           <input id="temp" class="ltr" type="number" min="0" max="2" step="0.1" value="0">
         </div>
       </div>
-      <label for="instr">دستور ابتدای متن (خود متن شما تغییر نمی‌کند)</label>
+      <label for="instr">دستور به مدل (جدا از متن فرستاده می‌شود و خوانده نمی‌شود)</label>
       <textarea id="instr" class="ltr" style="min-height:70px">Read the following text exactly as written, word for word, without adding, skipping or changing anything:</textarea>
-      <p class="hint">این جمله فقط هنگام ارسال، قبل از متن شما گذاشته می‌شود. اگر نمی‌خواهید، خالی‌اش کنید.</p>
+      <p class="hint">این دستور جدا از متن شما به مدل داده می‌شود، نه به‌عنوان بخشی از متن. اگر نمی‌خواهید، خالی‌اش کنید.</p>
       <button id="save" class="ghost">ذخیره تنظیمات</button>
     </details>
   </div>
@@ -143,29 +143,42 @@
     if (!text) { status("متنی وارد نشده.", true); return; }
     save(true);
 
+    // The instruction goes in systemInstruction, not in the spoken text, so it is not read aloud.
     const instr = $("instr").value.trim();
-    const fullText = instr ? instr + "\n\n" + text : text;
-    const body = {
-      contents: [{ parts: [{ text: fullText }] }],
-      generationConfig: {
-        responseModalities: ["AUDIO"],
-        temperature: isNaN(temp) ? 0 : temp,
-        speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: voice } } }
-      }
+    const makeBody = (withInstr) => {
+      const b = {
+        contents: [{ role: "user", parts: [{ text }] }],
+        generationConfig: {
+          responseModalities: ["AUDIO"],
+          temperature: isNaN(temp) ? 0 : temp,
+          speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: voice } } }
+        }
+      };
+      if (withInstr && instr) b.systemInstruction = { parts: [{ text: instr }] };
+      return b;
     };
+    const call = (b) => fetch(
+      "https://generativelanguage.googleapis.com/v1beta/models/" + encodeURIComponent(model) + ":generateContent",
+      { method: "POST", headers: { "Content-Type": "application/json", "x-goog-api-key": key }, body: JSON.stringify(b) }
+    );
 
     $("go").disabled = true;
     status("در حال ساخت صدا…");
     try {
-      const res = await fetch(
-        "https://generativelanguage.googleapis.com/v1beta/models/" + encodeURIComponent(model) + ":generateContent",
-        { method: "POST", headers: { "Content-Type": "application/json", "x-goog-api-key": key }, body: JSON.stringify(body) }
-      );
-      const data = await res.json().catch(() => ({}));
+      let instrDropped = false;
+      let res = await call(makeBody(true));
+      let data = await res.json().catch(() => ({}));
+      // If this model rejects system instructions, try once more without it.
+      if (!res.ok && res.status === 400 && instr) {
+        res = await call(makeBody(false));
+        data = await res.json().catch(() => ({}));
+        instrDropped = res.ok;
+      }
       if (!res.ok) {
         const msg = (data.error && data.error.message) || ("HTTP " + res.status);
         throw new Error(msg);
       }
+      window.__instrDropped = instrDropped;
       const parts = (data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts) || [];
       const audioPart = parts.find((p) => p.inlineData && p.inlineData.data);
       if (!audioPart) throw new Error("پاسخ گوگل صدا نداشت.");
@@ -181,7 +194,7 @@
       player.hidden = false;
       $("dl").href = lastUrl;
       $("dl").style.display = "inline-block";
-      status("آماده است.");
+      status(window.__instrDropped ? "آماده است. (این مدل دستور جداگانه را نپذیرفت و صدا بدون آن ساخته شد.)" : "آماده است.");
       player.play().catch(() => {});
     } catch (e) {
       status("خطا: " + e.message, true);
