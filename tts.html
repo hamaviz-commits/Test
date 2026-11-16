@@ -28,6 +28,9 @@
   #status { min-height:1.6em; margin:10px 0 0; font-size:14px; color:var(--muted); }
   #status.err { color:var(--err); }
   audio { width:100%; margin-top:12px; }
+  .speeds { display:flex; align-items:center; gap:8px; margin-top:10px; flex-wrap:wrap; }
+  .speeds button { background:transparent; color:var(--ink); border:1px solid var(--line); padding:8px 14px; font-size:15px; }
+  .speeds button.on { background:var(--accent); color:#fff; border-color:var(--accent); }
   #dl { display:none; margin-top:8px; color:var(--accent); }
   .hint { font-size:13px; color:var(--muted); }
 </style>
@@ -44,6 +47,12 @@
     </div>
     <div id="status"></div>
     <audio id="player" controls hidden></audio>
+    <div id="speeds" class="speeds" role="group" aria-label="سرعت پخش">
+      <span class="hint">سرعت پخش:</span>
+      <button type="button" data-rate="1">عادی</button>
+      <button type="button" data-rate="1.5">۱٫۵ برابر</button>
+      <button type="button" data-rate="2">۲ برابر</button>
+    </div>
     <a id="dl" download="speech.wav">ذخیره فایل صوتی</a>
   </div>
 
@@ -180,6 +189,28 @@
       $("go").disabled = false;
     }
   }
+
+  let rate = 1;
+  try { rate = parseFloat(localStorage.getItem(PREFIX + "rate")) || 1; } catch (e) {}
+  function applyRate() {
+    const player = $("player");
+    player.playbackRate = rate;
+    player.defaultPlaybackRate = rate;
+    if ("preservesPitch" in player) player.preservesPitch = true;
+    document.querySelectorAll("#speeds button").forEach((b) => {
+      b.classList.toggle("on", parseFloat(b.dataset.rate) === rate);
+    });
+  }
+  document.querySelectorAll("#speeds button").forEach((b) => {
+    b.addEventListener("click", () => {
+      rate = parseFloat(b.dataset.rate);
+      try { localStorage.setItem(PREFIX + "rate", String(rate)); } catch (e) {}
+      applyRate();
+    });
+  });
+  $("player").addEventListener("loadedmetadata", applyRate);
+  $("player").addEventListener("play", applyRate);
+  applyRate();
 
   $("go").addEventListener("click", generate);
   $("save").addEventListener("click", () => save(false));
