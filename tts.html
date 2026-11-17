@@ -28,6 +28,9 @@
   #status { min-height:1.6em; margin:10px 0 0; font-size:14px; color:var(--muted); }
   #status.err { color:var(--err); }
   audio { width:100%; margin-top:12px; }
+  .skips { display:flex; gap:10px; margin-top:10px; }
+  .skips button { flex:1; background:transparent; color:var(--ink); border:1px solid var(--line); padding:10px; font-size:15px; }
+  input[type=file] { padding:8px; font-size:14px; }
   .speeds { display:flex; align-items:center; gap:8px; margin-top:10px; flex-wrap:wrap; }
   .speeds button { background:transparent; color:var(--ink); border:1px solid var(--line); padding:8px 14px; font-size:15px; }
   .speeds button.on { background:var(--accent); color:#fff; border-color:var(--accent); }
@@ -47,6 +50,10 @@
     </div>
     <div id="status"></div>
     <audio id="player" controls hidden></audio>
+    <div class="skips" dir="ltr">
+      <button type="button" id="back4">⏪ ۴ ثانیه عقب</button>
+      <button type="button" id="fwd4">۴ ثانیه جلو ⏩</button>
+    </div>
     <div id="speeds" class="speeds" role="group" aria-label="سرعت پخش">
       <span class="hint">سرعت پخش:</span>
       <button type="button" data-rate="1">عادی</button>
@@ -54,6 +61,12 @@
       <button type="button" data-rate="2">۲ برابر</button>
     </div>
     <a id="dl" download="speech.wav">ذخیره فایل صوتی</a>
+  </div>
+
+  <div class="card">
+    <label for="openFile">باز کردن فایل صوتی ذخیره‌شده</label>
+    <input id="openFile" type="file" accept="audio/*,.wav,.mp3,.m4a,.ogg">
+    <p class="hint">فایلی را که قبلاً ذخیره کرده‌اید انتخاب کنید تا در همین پخش‌کننده، با دکمه‌های سرعت و جلو و عقب، پخش شود.</p>
   </div>
 
   <div class="card">
@@ -193,6 +206,7 @@
       player.src = lastUrl;
       player.hidden = false;
       $("dl").href = lastUrl;
+      $("dl").download = fileNameFrom(text) + ".wav";
       $("dl").style.display = "inline-block";
       status(window.__instrDropped ? "آماده است. (این مدل دستور جداگانه را نپذیرفت و صدا بدون آن ساخته شد.)" : "آماده است.");
       player.play().catch(() => {});
@@ -202,6 +216,39 @@
       $("go").disabled = false;
     }
   }
+
+  // File name from the first few words of the text.
+  function fileNameFrom(t) {
+    const words = t.replace(/[\\\/:*?"<>|\r\n\t]+/g, " ").trim().split(/\s+/).slice(0, 6).join(" ");
+    let name = words.replace(/[.\s]+$/, "");
+    if (name.length > 60) name = name.slice(0, 60).trim();
+    return name || "speech";
+  }
+
+  // Skip back / forward 4 seconds.
+  function skip(sec) {
+    const p = $("player");
+    if (!p.src) return;
+    const d = isFinite(p.duration) ? p.duration : Infinity;
+    p.currentTime = Math.min(Math.max(0, p.currentTime + sec), d);
+  }
+  $("back4").addEventListener("click", () => skip(-4));
+  $("fwd4").addEventListener("click", () => skip(4));
+
+  // Open a saved audio file.
+  $("openFile").addEventListener("change", (e) => {
+    const f = e.target.files && e.target.files[0];
+    if (!f) return;
+    if (lastUrl) URL.revokeObjectURL(lastUrl);
+    lastUrl = URL.createObjectURL(f);
+    const player = $("player");
+    player.src = lastUrl;
+    player.hidden = false;
+    $("dl").style.display = "none";
+    status("در حال پخش: " + f.name);
+    player.play().catch(() => {});
+    player.scrollIntoView({ behavior: "smooth", block: "center" });
+  });
 
   let rate = 1;
   try { rate = parseFloat(localStorage.getItem(PREFIX + "rate")) || 1; } catch (e) {}
