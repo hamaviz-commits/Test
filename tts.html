@@ -30,6 +30,10 @@
   audio { width:100%; margin-top:12px; }
   .skips { display:flex; gap:10px; margin-top:10px; }
   .skips button { flex:1; background:transparent; color:var(--ink); border:1px solid var(--line); padding:10px; font-size:15px; }
+  .readbox { position:relative; max-height:45vh; overflow:auto; white-space:pre-wrap; line-height:2.1; border:1px solid var(--line); border-radius:10px; padding:10px; font-size:17px; }
+  .readbox span.w { cursor:pointer; border-radius:5px; padding:1px 0; transition:background .12s; }
+  .readbox span.s { background:rgba(36,87,214,.12); }
+  .readbox span.cur { background:var(--accent); color:#fff; }
   input[type=file] { padding:8px; font-size:14px; }
   .speeds { display:flex; align-items:center; gap:8px; margin-top:10px; flex-wrap:wrap; }
   .speeds button { background:transparent; color:var(--ink); border:1px solid var(--line); padding:8px 14px; font-size:15px; }
@@ -61,6 +65,13 @@
       <button type="button" data-rate="2">۲ برابر</button>
     </div>
     <a id="dl" download="speech.wav">ذخیره فایل صوتی</a>
+  </div>
+
+  <div class="card" id="readCard" hidden>
+    <label>متن همراه صدا (روی هر کلمه بزنید تا از همان‌جا پخش شود)</label>
+    <div id="readBox" class="readbox" dir="auto"></div>
+    <p id="readHint" class="hint" hidden>برای دیدن متن هنگام پخش، متن همین فایل را در کادر «متن» بالا بگذارید و دکمه زیر را بزنید.</p>
+    <button type="button" id="syncText" class="ghost">به‌روزرسانی از کادر متن</button>
   </div>
 
   <div class="card">
@@ -200,11 +211,8 @@
       const bytes = b64ToBytes(audioPart.inlineData.data);
       const blob = /wav/i.test(mime) ? new Blob([bytes], { type: "audio/wav" }) : pcmToWav(bytes, rateMatch ? parseInt(rateMatch[1], 10) : 24000);
 
-      if (lastUrl) URL.revokeObjectURL(lastUrl);
-      lastUrl = URL.createObjectURL(blob);
+      setAudio(blob, text);
       const player = $("player");
-      player.src = lastUrl;
-      player.hidden = false;
       $("dl").href = lastUrl;
       $("dl").download = fileNameFrom(text) + ".wav";
       $("dl").style.display = "inline-block";
@@ -239,16 +247,168 @@
   $("openFile").addEventListener("change", (e) => {
     const f = e.target.files && e.target.files[0];
     if (!f) return;
-    if (lastUrl) URL.revokeObjectURL(lastUrl);
-    lastUrl = URL.createObjectURL(f);
+    setAudio(f, $("text").value.trim());
     const player = $("player");
-    player.src = lastUrl;
-    player.hidden = false;
     $("dl").style.display = "none";
     status("در حال پخش: " + f.name);
     player.play().catch(() => {});
     player.scrollIntoView({ behavior: "smooth", block: "center" });
   });
+
+  // ---- Follow-along reading view ----
+  // The speech API gives no word timings, so each word's time is estimated from its
+  // length and the pauses after punctuation, spread over the part of the audio that
+  // is not silence. Close for steady reading, but can drift by a few words.
+  const R = { spans: [], weights: [], pauses: [], sent: [], starts: [], ends: [], cur: -1, curSent: -1, region: null, raf: 0 };
+
+  function setAudio(blob, t) {
+    if (lastUrl) URL.revokeObjectURL(lastUrl);
+    lastUrl = URL.createObjectURL(blob);
+    const player = $("player");
+    player.src = lastUrl;
+    player.hidden = false;
+    R.region = null;
+    buildReading(t);
+    analyzeBlob(blob).then((r) => { R.region = r; computeTimes(); }).catch(() => {});
+  }
+
+  function buildReading(t) {
+    const box = $("readBox");
+    box.textContent = "";
+    R.spans = []; R.weights = []; R.pauses = []; R.sent = []; R.starts = []; R.ends = [];
+    R.cur = -1; R.curSent = -1;
+    $("readCard").hidden = false;
+    if (!t) { box.hidden = true; $("readHint").hidden = false; return; }
+    box.hidden = false; $("readHint").hidden = true;
+    const parts = t.split(/(\s+)/);
+    let sent = 0;
+    for (let k = 0; k < parts.length; k++) {
+      const p = parts[k];
+      if (!p) continue;
+      if (/^\s+$/.test(p)) {
+        box.appendChild(document.createTextNode(p));
+        if (R.pauses.length && /\n/.test(p)) { R.pauses[R.pauses.length - 1] += 6; sent++; }
+        continue;
+      }
+      const s = document.createElement("span");
+      s.className = "w";
+      s.textContent = p;
+      s.dataset.i = R.spans.length;
+      box.appendChild(s);
+      const letters = p.replace(/[^\p{L}\p{N}]/gu, "").length;
+      let pause = 0;
+      if (/[.!?؟…]["»”')\]]*$/.test(p)) pause = 7;
+      else if (/[,،;؛:]["»”')\]]*$/.test(p)) pause = 3;
+      R.spans.push(s); R.weights.push(Math.max(1, letters) + 1); R.pauses.push(pause); R.sent.push(sent);
+      if (pause === 7) sent++;
+    }
+    box.scrollTop = 0;
+    computeTimes();
+  }
+
+  function computeTimes() {
+    const p = $("player");
+    const n = R.spans.length;
+    if (!n || !isFinite(p.duration) || p.duration <= 0) return;
+    const t0 = R.region ? R.region.t0 : 0;
+    const t1 = R.region ? R.region.t1 : p.duration;
+    let total = 0;
+    for (let i = 0; i < n; i++) total += R.weights[i] + (i < n - 1 ? R.pauses[i] : 0);
+    let cum = 0;
+    for (let i = 0; i < n; i++) {
+      R.starts[i] = t0 + (cum / total) * (t1 - t0);
+      cum += R.weights[i];
+      R.ends[i] = t0 + (cum / total) * (t1 - t0);
+      if (i < n - 1) cum += R.pauses[i];
+    }
+    tick();
+  }
+
+  // Find where speech starts and ends, ignoring silence at both ends.
+  async function analyzeBlob(blob) {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return null;
+    const ctx = new AC();
+    try {
+      const buf = await ctx.decodeAudioData(await blob.arrayBuffer());
+      const d = buf.getChannelData(0);
+      const frame = Math.max(1, Math.round(buf.sampleRate * 0.02));
+      const rms = [];
+      let peak = 0;
+      for (let i = 0; i < d.length; i += frame) {
+        let s = 0;
+        const end = Math.min(d.length, i + frame);
+        for (let j = i; j < end; j++) s += d[j] * d[j];
+        const v = Math.sqrt(s / (end - i));
+        rms.push(v);
+        if (v > peak) peak = v;
+      }
+      const th = Math.max(0.005, peak * 0.06);
+      let a = 0, b = rms.length - 1;
+      while (a < rms.length && rms[a] < th) a++;
+      while (b > a && rms[b] < th) b--;
+      const fs = frame / buf.sampleRate;
+      return { t0: a * fs, t1: Math.min(buf.duration, (b + 1) * fs) };
+    } finally {
+      try { ctx.close(); } catch (e) {}
+    }
+  }
+
+  function wordAt(t) {
+    const s = R.starts;
+    if (!s.length || t < s[0]) return -1;
+    let lo = 0, hi = s.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi + 1) >> 1;
+      if (s[mid] <= t) lo = mid; else hi = mid - 1;
+    }
+    return lo;
+  }
+
+  function highlight(i) {
+    if (i === R.cur) return;
+    if (R.cur >= 0 && R.spans[R.cur]) R.spans[R.cur].classList.remove("cur");
+    const sNew = i >= 0 ? R.sent[i] : -1;
+    if (sNew !== R.curSent) {
+      R.spans.forEach((sp, k) => sp.classList.toggle("s", R.sent[k] === sNew));
+      R.curSent = sNew;
+    }
+    R.cur = i;
+    if (i < 0) return;
+    const sp = R.spans[i];
+    sp.classList.add("cur");
+    const box = $("readBox");
+    const top = sp.offsetTop, h = sp.offsetHeight;
+    if (top < box.scrollTop + 10 || top + h > box.scrollTop + box.clientHeight - 10) {
+      box.scrollTop = Math.max(0, top - box.clientHeight / 2);
+    }
+  }
+
+  function tick() {
+    if (!R.starts.length) return;
+    highlight(wordAt($("player").currentTime));
+  }
+  function loop() {
+    tick();
+    R.raf = $("player").paused ? 0 : requestAnimationFrame(loop);
+  }
+  $("player").addEventListener("play", () => { if (!R.raf) R.raf = requestAnimationFrame(loop); });
+  $("player").addEventListener("loadedmetadata", computeTimes);
+  $("player").addEventListener("seeked", tick);
+  $("player").addEventListener("timeupdate", tick);
+
+  // Tap a word to play from there.
+  $("readBox").addEventListener("click", (e) => {
+    const sp = e.target.closest && e.target.closest("span.w");
+    if (!sp) return;
+    const i = parseInt(sp.dataset.i, 10);
+    if (isNaN(i) || !R.starts.length) return;
+    const p = $("player");
+    p.currentTime = Math.max(0, R.starts[i] - 0.15);
+    highlight(i);
+    p.play().catch(() => {});
+  });
+  $("syncText").addEventListener("click", () => buildReading($("text").value.trim()));
 
   let rate = 1;
   try { rate = parseFloat(localStorage.getItem(PREFIX + "rate")) || 1; } catch (e) {}
