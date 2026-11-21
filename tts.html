@@ -156,6 +156,79 @@
 
   let lastUrl = null;
 
+  // ---- Talking to the Gemini API ----
+  const API = "https://generativelanguage.googleapis.com/v1beta/models/";
+  async function api(key, model, method, body) {
+    const res = await fetch(API + encodeURIComponent(model) + ":" + method, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-goog-api-key": key },
+      body: JSON.stringify(body)
+    });
+    const data = await res.json().catch(() => ({}));
+    return { res, data, msg: (data.error && data.error.message) || ("HTTP " + res.status) };
+  }
+
+  // Exact token count from Google (free; does not use the daily speech quota).
+  async function countTokens(key, model, text) {
+    for (const m of [model, "gemini-3.8-flash"]) {
+      try {
+        const { res, data } = await api(key, m, "countTokens", { contents: [{ role: "user", parts: [{ text }] }] });
+        if (res.ok && typeof data.totalTokens === "number") return data.totalTokens;
+      } catch (e) {}
+    }
+    return Math.ceil(text.length / 2.2); // rough fallback if counting is unavailable
+  }
+
+  // Free-tier limit on input tokens per minute (learned from Google's error if it differs).
+  function tokenLimit() {
+    try { return parseInt(localStorage.getItem(PREFIX + "tpm"), 10) || 10000; } catch (e) { return 10000; }
+  }
+
+  // Places where the text may be cut: paragraph starts first, then sentence ends.
+  function cutPoints(t, sentences) {
+    const out = [];
+    const re = sentences ? /[.!?؟…]["»”')\]]*\s+/g : /\n\s*/g;
+    let m;
+    while ((m = re.exec(t))) { const i = m.index + m[0].length; if (i > 0 && i < t.length) out.push(i); }
+    return out;
+  }
+
+  // Split into exactly n pieces of similar length, cutting only between paragraphs
+  // (or between sentences if there are not enough paragraphs). The pieces joined back
+  // together are exactly the original text.
+  function splitInto(t, n) {
+    if (n <= 1) return [t];
+    let cuts = cutPoints(t, false);
+    if (cuts.length < n - 1) cuts = Array.from(new Set(cuts.concat(cutPoints(t, true)))).sort((x, y) => x - y);
+    const chosen = [];
+    let prev = 0;
+    for (let k = 1; k < n; k++) {
+      const target = (t.length * k) / n;
+      let best = -1, bestD = Infinity;
+      for (const c of cuts) {
+        if (c <= prev) continue;
+        const d = Math.abs(c - target);
+        if (d < bestD) { bestD = d; best = c; }
+      }
+      if (best < 0) break;
+      chosen.push(best); prev = best;
+    }
+    const pieces = [];
+    let start = 0;
+    for (const c of chosen) { pieces.push(t.slice(start, c)); start = c; }
+    pieces.push(t.slice(start));
+    return pieces.filter((x) => x.trim());
+  }
+
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  async function countdown(sec, label) {
+    for (let s = Math.ceil(sec); s > 0; s--) { status(label + " (" + s + " ثانیه)"); await sleep(1000); }
+  }
+  function retrySeconds(msg) {
+    const m = /retry in ([\d.]+)s/i.exec(msg);
+    return m ? parseFloat(m[1]) : 60;
+  }
+
   async function generate() {
     const key = $("key").value.trim();
     const model = $("model").value.trim();
@@ -168,54 +241,120 @@
 
     // The instruction goes in systemInstruction, not in the spoken text, so it is not read aloud.
     const instr = $("instr").value.trim();
-    const makeBody = (withInstr) => {
+    let useInstr = !!instr;
+    const makeBody = (piece) => {
       const b = {
-        contents: [{ role: "user", parts: [{ text }] }],
+        contents: [{ role: "user", parts: [{ text: piece }] }],
         generationConfig: {
           responseModalities: ["AUDIO"],
           temperature: isNaN(temp) ? 0 : temp,
           speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: voice } } }
         }
       };
-      if (withInstr && instr) b.systemInstruction = { parts: [{ text: instr }] };
+      if (useInstr) b.systemInstruction = { parts: [{ text: instr }] };
       return b;
     };
-    const call = (b) => fetch(
-      "https://generativelanguage.googleapis.com/v1beta/models/" + encodeURIComponent(model) + ":generateContent",
-      { method: "POST", headers: { "Content-Type": "application/json", "x-goog-api-key": key }, body: JSON.stringify(b) }
-    );
 
     $("go").disabled = true;
-    status("در حال ساخت صدا…");
     try {
-      let instrDropped = false;
-      let res = await call(makeBody(true));
-      let data = await res.json().catch(() => ({}));
-      // If this model rejects system instructions, try once more without it.
-      if (!res.ok && res.status === 400 && instr) {
-        res = await call(makeBody(false));
-        data = await res.json().catch(() => ({}));
-        instrDropped = res.ok;
+      // 1) Work out how many pieces are needed: as few as the per-minute token limit allows.
+      status("در حال شمردن توکن‌های متن…");
+      const limit = tokenLimit();
+      const instrTokens = instr ? await countTokens(key, model, instr) : 0;
+      const room = Math.max(1000, limit - instrTokens - 300);
+      const total = await countTokens(key, model, text);
+      let n = Math.max(1, Math.ceil(total / room));
+      let pieces = splitInto(text, n);
+      for (let tries = 0; tries < 4 && pieces.length > 1; tries++) {
+        const counts = [];
+        for (const p of pieces) counts.push(await countTokens(key, model, p));
+        if (counts.every((c) => c <= room)) break;
+        n++; pieces = splitInto(text, n);
       }
-      if (!res.ok) {
-        const msg = (data.error && data.error.message) || ("HTTP " + res.status);
-        throw new Error(msg);
-      }
-      window.__instrDropped = instrDropped;
-      const parts = (data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts) || [];
-      const audioPart = parts.find((p) => p.inlineData && p.inlineData.data);
-      if (!audioPart) throw new Error("پاسخ گوگل صدا نداشت.");
-      const mime = audioPart.inlineData.mimeType || "";
-      const rateMatch = mime.match(/rate=(\d+)/);
-      const bytes = b64ToBytes(audioPart.inlineData.data);
-      const blob = /wav/i.test(mime) ? new Blob([bytes], { type: "audio/wav" }) : pcmToWav(bytes, rateMatch ? parseInt(rateMatch[1], 10) : 24000);
+      const plan = pieces.length > 1
+        ? "این متن حدود " + total.toLocaleString("fa-IR") + " توکن است و سقف هر دقیقه " + limit.toLocaleString("fa-IR") + " توکن؛ در " + pieces.length.toLocaleString("fa-IR") + " بخش ساخته می‌شود. "
+        : "";
 
-      setAudio(blob, text);
+      // 2) Make each piece in turn, waiting between pieces for the per-minute limit.
+      const pcm = [];
+      let rate = 24000, lastSend = 0;
+      const warn = [];
+      let stoppedForDay = false, stopMsg = "";
+      for (let i = 0; i < pieces.length; i++) {
+        const label = pieces.length > 1 ? plan + "بخش " + (i + 1).toLocaleString("fa-IR") + " از " + pieces.length.toLocaleString("fa-IR") : "در حال ساخت صدا…";
+        if (i > 0) {
+          const wait = 62 - (Date.now() - lastSend) / 1000;
+          if (wait > 0) await countdown(wait, plan + "صبر برای سقف دقیقه‌ای قبل از بخش " + (i + 1).toLocaleString("fa-IR"));
+        }
+        let out = null;
+        for (let attempt = 0; attempt < 4 && !out; attempt++) {
+          status(label + "…");
+          lastSend = Date.now();
+          let { res, data, msg } = await api(key, model, "generateContent", makeBody(pieces[i]));
+          if (!res.ok && res.status === 400 && useInstr) {
+            useInstr = false; // this model does not take a separate instruction
+            ({ res, data, msg } = await api(key, model, "generateContent", makeBody(pieces[i])));
+          }
+          if (res.ok) { out = data; break; }
+          if (res.status === 429) {
+            const lm = /input_token_count[^]*?limit:\s*(\d+)/i.exec(msg);
+            if (lm) { try { localStorage.setItem(PREFIX + "tpm", lm[1]); } catch (e) {} }
+            if (/per day|requests_per_day|PerDay|free_tier_requests/i.test(msg)) { stoppedForDay = true; stopMsg = msg; break; }
+            await countdown(retrySeconds(msg) + 2, label + "؛ سقف دقیقه‌ای پر شد، صبر");
+            continue;
+          }
+          throw new Error(msg);
+        }
+        if (stoppedForDay) break;
+        if (!out) throw new Error("بخش " + (i + 1) + " ساخته نشد. چند دقیقه بعد دوباره امتحان کنید.");
+        const cand = out.candidates && out.candidates[0];
+        const parts = (cand && cand.content && cand.content.parts) || [];
+        const audioPart = parts.find((p) => p.inlineData && p.inlineData.data);
+        if (!audioPart) throw new Error("پاسخ گوگل برای بخش " + (i + 1) + " صدا نداشت.");
+        const mime = audioPart.inlineData.mimeType || "";
+        const rm = mime.match(/rate=(\d+)/);
+        if (rm) rate = parseInt(rm[1], 10);
+        let bytes = b64ToBytes(audioPart.inlineData.data);
+        if (bytes.length > 44 && String.fromCharCode(bytes[0], bytes[1], bytes[2], bytes[3]) === "RIFF") {
+          rate = new DataView(bytes.buffer).getUint32(24, true);
+          bytes = bytes.slice(44);
+        }
+        if (cand.finishReason && cand.finishReason !== "STOP") warn.push(i + 1);
+        pcm.push(bytes);
+      }
+
+      if (!pcm.length) {
+        throw new Error("سهمیه روزانه تمام شده است. " + (stopMsg ? "(" + stopMsg + ")" : ""));
+      }
+
+      // 3) Join the pieces into one file, with a short pause between them.
+      const gap = new Uint8Array(Math.round(rate * 0.5) * 2);
+      const all = [];
+      const segs = [];
+      let offset = 0;
+      pcm.forEach((b, i) => {
+        if (i > 0) { all.push(gap); offset += gap.length / 2 / rate; }
+        const r = analyzePCM(b, rate);
+        segs.push({ text: pieces[i], t0: offset + r.t0, t1: offset + r.t1 });
+        all.push(b); offset += b.length / 2 / rate;
+      });
+      const totalLen = all.reduce((s2, b) => s2 + b.length, 0);
+      const joined = new Uint8Array(totalLen);
+      let pos = 0;
+      for (const b of all) { joined.set(b, pos); pos += b.length; }
+      const madeText = pieces.slice(0, pcm.length).join("");
+      setAudio(pcmToWav(joined, rate), madeText, segs);
+
       const player = $("player");
       $("dl").href = lastUrl;
       $("dl").download = fileNameFrom(text) + ".wav";
       $("dl").style.display = "inline-block";
-      status(window.__instrDropped ? "آماده است. (این مدل دستور جداگانه را نپذیرفت و صدا بدون آن ساخته شد.)" : "آماده است.");
+      let done = "آماده است.";
+      if (pieces.length > 1) done = "آماده است. (" + pcm.length.toLocaleString("fa-IR") + " بخش به هم وصل شد)";
+      if (stoppedForDay) done = "فقط " + pcm.length.toLocaleString("fa-IR") + " بخش از " + pieces.length.toLocaleString("fa-IR") + " ساخته شد، چون سهمیه روزانه تمام شد. بقیه متن را فردا بسازید.";
+      if (warn.length) done += " هشدار: بخش " + warn.join("، ") + " ممکن است کامل نباشد.";
+      if (instr && !useInstr) done += " (این مدل دستور جداگانه را نپذیرفت و صدا بدون آن ساخته شد.)";
+      status(done, stoppedForDay);
       player.play().catch(() => {});
     } catch (e) {
       status("خطا: " + e.message, true);
@@ -260,27 +399,53 @@
   // is not silence. Close for steady reading, but can drift by a few words.
   const R = { spans: [], weights: [], pauses: [], sent: [], starts: [], ends: [], cur: -1, curSent: -1, region: null, raf: 0 };
 
-  function setAudio(blob, t) {
+  function setAudio(blob, t, segs) {
     if (lastUrl) URL.revokeObjectURL(lastUrl);
     lastUrl = URL.createObjectURL(blob);
     const player = $("player");
     player.src = lastUrl;
     player.hidden = false;
     R.region = null;
-    buildReading(t);
-    analyzeBlob(blob).then((r) => { R.region = r; computeTimes(); }).catch(() => {});
+    buildReading(t, segs);
+    if (!segs) analyzeBlob(blob).then((r) => { R.region = r; computeTimes(); }).catch(() => {});
   }
 
-  function buildReading(t) {
+  // Where speech starts and ends inside one piece of raw 16-bit audio.
+  function analyzePCM(bytes, rate) {
+    const n = Math.floor(bytes.length / 2);
+    const dv = new DataView(bytes.buffer, bytes.byteOffset, n * 2);
+    const frame = Math.max(1, Math.round(rate * 0.02));
+    const rms = [];
+    let peak = 0;
+    for (let i = 0; i < n; i += frame) {
+      let s2 = 0;
+      const end = Math.min(n, i + frame);
+      for (let j = i; j < end; j++) { const v = dv.getInt16(j * 2, true) / 32768; s2 += v * v; }
+      const v = Math.sqrt(s2 / (end - i));
+      rms.push(v);
+      if (v > peak) peak = v;
+    }
+    const th = Math.max(0.005, peak * 0.06);
+    let a = 0, b = rms.length - 1;
+    while (a < rms.length && rms[a] < th) a++;
+    while (b > a && rms[b] < th) b--;
+    const fs = frame / rate;
+    return { t0: a * fs, t1: Math.min(n / rate, (b + 1) * fs) };
+  }
+
+  function buildReading(t, segs) {
     const box = $("readBox");
     box.textContent = "";
-    R.spans = []; R.weights = []; R.pauses = []; R.sent = []; R.starts = []; R.ends = [];
+    R.spans = []; R.weights = []; R.pauses = []; R.sent = []; R.starts = []; R.ends = []; R.segs = [];
     R.cur = -1; R.curSent = -1;
     $("readCard").hidden = false;
     if (!t) { box.hidden = true; $("readHint").hidden = false; return; }
     box.hidden = false; $("readHint").hidden = true;
-    const parts = t.split(/(\s+)/);
     let sent = 0;
+    const pieces = segs ? segs : [{ text: t }];
+    for (const seg of pieces) {
+    const a0 = R.spans.length;
+    const parts = seg.text.split(/(\s+)/);
     for (let k = 0; k < parts.length; k++) {
       const p = parts[k];
       if (!p) continue;
@@ -301,6 +466,8 @@
       R.spans.push(s); R.weights.push(Math.max(1, letters) + 1); R.pauses.push(pause); R.sent.push(sent);
       if (pause === 7) sent++;
     }
+    R.segs.push({ a: a0, b: R.spans.length, t0: seg.t0, t1: seg.t1 });
+    }
     box.scrollTop = 0;
     computeTimes();
   }
@@ -309,16 +476,20 @@
     const p = $("player");
     const n = R.spans.length;
     if (!n || !isFinite(p.duration) || p.duration <= 0) return;
-    const t0 = R.region ? R.region.t0 : 0;
-    const t1 = R.region ? R.region.t1 : p.duration;
-    let total = 0;
-    for (let i = 0; i < n; i++) total += R.weights[i] + (i < n - 1 ? R.pauses[i] : 0);
-    let cum = 0;
-    for (let i = 0; i < n; i++) {
-      R.starts[i] = t0 + (cum / total) * (t1 - t0);
-      cum += R.weights[i];
-      R.ends[i] = t0 + (cum / total) * (t1 - t0);
-      if (i < n - 1) cum += R.pauses[i];
+    const segs = (R.segs && R.segs.length && R.segs[0].t0 !== undefined)
+      ? R.segs
+      : [{ a: 0, b: n, t0: R.region ? R.region.t0 : 0, t1: R.region ? R.region.t1 : p.duration }];
+    for (const sg of segs) {
+      let total = 0;
+      for (let i = sg.a; i < sg.b; i++) total += R.weights[i] + (i < sg.b - 1 ? R.pauses[i] : 0);
+      if (!total) continue;
+      let cum = 0;
+      for (let i = sg.a; i < sg.b; i++) {
+        R.starts[i] = sg.t0 + (cum / total) * (sg.t1 - sg.t0);
+        cum += R.weights[i];
+        R.ends[i] = sg.t0 + (cum / total) * (sg.t1 - sg.t0);
+        if (i < sg.b - 1) cum += R.pauses[i];
+      }
     }
     tick();
   }
