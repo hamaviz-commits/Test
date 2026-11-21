@@ -68,6 +68,7 @@
     <div class="card" id="readCard" style="margin:12px 0 0" hidden>
       <label>متن همراه صدا (روی هر کلمه بزنید تا از همان‌جا پخش شود)</label>
       <div id="readBox" class="readbox" dir="auto"></div>
+      <button type="button" id="followBtn" class="ghost" hidden>↩ برگشت به جای در حال خواندن</button>
       <p id="readHint" class="hint" hidden>برای دیدن متن هنگام پخش، متن همین فایل را در کادر «متن» بالا بگذارید و دکمه زیر را بزنید.</p>
       <button type="button" id="syncText" class="ghost">به‌روزرسانی از کادر متن</button>
     </div>
@@ -438,6 +439,7 @@
     box.textContent = "";
     R.spans = []; R.weights = []; R.pauses = []; R.sent = []; R.starts = []; R.ends = []; R.segs = [];
     R.cur = -1; R.curSent = -1;
+    setFollow(true);
     $("readCard").hidden = false;
     if (!t) { box.hidden = true; $("readHint").hidden = false; return; }
     box.hidden = false; $("readHint").hidden = true;
@@ -547,6 +549,7 @@
     if (i < 0) return;
     const sp = R.spans[i];
     sp.classList.add("cur");
+    if (!R.follow) return; // the reader has scrolled away; leave the view where they put it
     const box = $("readBox");
     const top = sp.offsetTop, h = sp.offsetHeight;
     if (top < box.scrollTop + 10 || top + h > box.scrollTop + box.clientHeight - 10) {
@@ -575,8 +578,23 @@
     if (isNaN(i) || !R.starts.length) return;
     const p = $("player");
     p.currentTime = Math.max(0, R.starts[i] - 0.15);
+    setFollow(true);
     highlight(i);
     p.play().catch(() => {});
+  });
+  // When the reader scrolls the text themselves, stop following the voice
+  // (the highlight keeps moving) until they tap a word or the return button.
+  function setFollow(on) {
+    R.follow = on;
+    $("followBtn").hidden = on || !R.spans.length;
+  }
+  ["touchstart", "wheel", "mousedown", "keydown"].forEach((ev) =>
+    $("readBox").addEventListener(ev, () => setFollow(false), { passive: true }));
+  $("followBtn").addEventListener("click", () => {
+    setFollow(true);
+    const i = R.cur;
+    R.cur = -1;
+    highlight(i);
   });
   $("syncText").addEventListener("click", () => buildReading($("text").value.trim()));
 
