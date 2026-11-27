@@ -355,6 +355,8 @@
       if (stoppedForDay) done = "فقط " + pcm.length.toLocaleString("fa-IR") + " بخش از " + pieces.length.toLocaleString("fa-IR") + " ساخته شد، چون سهمیه روزانه تمام شد. بقیه متن را فردا بسازید.";
       if (warn.length) done += " هشدار: بخش " + warn.join("، ") + " ممکن است کامل نباشد.";
       if (instr && !useInstr) done += " (این مدل دستور جداگانه را نپذیرفت و صدا بدون آن ساخته شد.)";
+      // Save the file right away, so it is not lost if the page is refreshed.
+      try { $("dl").click(); done += " فایل در پوشه دانلود هم ذخیره شد."; } catch (e) {}
       status(done, stoppedForDay);
       player.play().catch(() => {});
     } catch (e) {
